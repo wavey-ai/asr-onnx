@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use ndarray::{Array2, Array3, ArrayD, Ix3, IxDyn, s};
 use ort::execution_providers::{
     CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider, ExecutionProviderDispatch,
+    TensorRTExecutionProvider,
 };
 use ort::logging::LogLevel;
 use ort::session::Session;
@@ -31,13 +32,20 @@ fn ort_error<E: std::fmt::Display>(error: E) -> anyhow::Error {
 }
 
 fn session_from_provider(path: &Path, provider: ExecutionProviderDispatch) -> Result<Session> {
+    session_from_providers(path, [provider])
+}
+
+fn session_from_providers(
+    path: &Path,
+    providers: impl AsRef<[ExecutionProviderDispatch]>,
+) -> Result<Session> {
     Session::builder()
         .map_err(ort_error)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(ort_error)?
         .with_log_level(LogLevel::Info)
         .map_err(ort_error)?
-        .with_execution_providers([provider])
+        .with_execution_providers(providers)
         .map_err(ort_error)?
         .with_intra_threads(1)
         .map_err(ort_error)?
@@ -75,6 +83,11 @@ pub struct Config {
     pub blank_idx: usize,
     pub num_sessions: usize,
     pub trt_cache_dir: String,
+    pub trt_components: String,
+    pub trt_workspace_bytes: usize,
+    pub trt_builder_optimization_level: u8,
+    pub trt_fp16: bool,
+    pub trt_detailed_build_log: bool,
     pub features_size: usize,
     pub subsampling_factor: usize,
     pub max_symbols_per_step: usize,
@@ -93,6 +106,11 @@ impl Default for Config {
             blank_idx: 1024,
             num_sessions: 4,
             trt_cache_dir: "./.trt_cache".into(),
+            trt_components: "encoder,joint_enc".into(),
+            trt_workspace_bytes: 4 * 1024 * 1024 * 1024,
+            trt_builder_optimization_level: 5,
+            trt_fp16: true,
+            trt_detailed_build_log: false,
             features_size: 128,
             subsampling_factor: 8,
             max_symbols_per_step: 10,
@@ -122,6 +140,29 @@ impl Config {
         self.max_duration_s = self.max_duration_s.max(self.min_duration_s);
         self.opt_duration_s =
             (((self.min_duration_s + self.max_duration_s) as f32) / 2.0).round() as usize;
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_COMPONENTS") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.trt_components = trimmed.to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_WORKSPACE_BYTES") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.trt_workspace_bytes = n.max(1 << 20);
+            }
+        }
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_BUILDER_OPT_LEVEL") {
+            if let Ok(n) = v.parse::<u8>() {
+                self.trt_builder_optimization_level = n.min(5);
+            }
+        }
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_FP16") {
+            self.trt_fp16 = matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_DETAILED_BUILD_LOG") {
+            self.trt_detailed_build_log =
+                matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
         self
     }
     pub fn with_num_sessions(mut self, v: usize) -> Self {
@@ -143,6 +184,159 @@ impl Config {
     pub fn sample_rate(&self) -> usize {
         self.sample_rate
     }
+
+    fn uses_tensorrt_for(&self, component: ModelComponent) -> bool {
+        self.trt_components
+            .split(',')
+            .map(|item| item.trim().to_ascii_lowercase())
+            .any(|item| item == "all" || item == component.config_token())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelComponent {
+    Encoder,
+    Decoder,
+    JointEnc,
+    JointPred,
+    JointNet,
+}
+
+impl ModelComponent {
+    fn config_token(self) -> &'static str {
+        match self {
+            Self::Encoder => "encoder",
+            Self::Decoder => "decoder",
+            Self::JointEnc => "joint_enc",
+            Self::JointPred => "joint_pred",
+            Self::JointNet => "joint_net",
+        }
+    }
+
+    fn cache_prefix(self) -> &'static str {
+        self.config_token()
+    }
+}
+
+fn encoded_steps_for(seq_len: usize, subsampling_factor: usize) -> usize {
+    seq_len.div_ceil(subsampling_factor.max(1)).max(1)
+}
+
+fn input_shapes(path: &Path) -> Result<Vec<(String, Vec<usize>)>> {
+    let session = session_from_provider(path, CPUExecutionProvider::default().build())?;
+    Ok(session
+        .inputs()
+        .iter()
+        .map(|input| {
+            (
+                input.name().to_string(),
+                concrete_shape(input.dtype()).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+fn format_profile_entry(name: &str, dims: &[usize]) -> String {
+    format!(
+        "{}:{}",
+        name,
+        dims.iter()
+            .map(|dim| dim.to_string())
+            .collect::<Vec<_>>()
+            .join("x")
+    )
+}
+
+fn tensorrt_profile(
+    component: ModelComponent,
+    config: &Config,
+    shapes: &[(String, Vec<usize>)],
+    seconds: usize,
+) -> Option<String> {
+    let seq_len = ((config.sample_rate * seconds) - config.window) / config.hop + 1;
+    let time_encoded = encoded_steps_for(seq_len, config.subsampling_factor);
+    let mut entries = Vec::new();
+
+    for (name, shape) in shapes {
+        if shape.is_empty() {
+            continue;
+        }
+        let mut dims = shape.clone();
+        match component {
+            ModelComponent::Encoder if name == "audio_signal" && dims.len() >= 3 => {
+                dims[0] = 1;
+                dims[1] = config.features_size;
+                dims[2] = seq_len;
+                entries.push(format_profile_entry(name, &dims));
+            }
+            ModelComponent::JointEnc if name == "encoder_outputs" && dims.len() >= 3 => {
+                dims[0] = 1;
+                dims[1] = time_encoded;
+                entries.push(format_profile_entry(name, &dims));
+            }
+            _ => {}
+        }
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(","))
+    }
+}
+
+fn provider_chain(
+    component: ModelComponent,
+    device_id: usize,
+    config: &Config,
+    cache_dir: &str,
+    shapes: Option<&[(String, Vec<usize>)]>,
+) -> Vec<ExecutionProviderDispatch> {
+    let mut providers = Vec::new();
+
+    if config.uses_tensorrt_for(component) {
+        let mut tensorrt = TensorRTExecutionProvider::default()
+            .with_device_id(device_id as i32)
+            .with_engine_cache(true)
+            .with_engine_cache_path(cache_dir)
+            .with_engine_cache_prefix(component.cache_prefix())
+            .with_timing_cache(true)
+            .with_timing_cache_path(cache_dir)
+            .with_max_workspace_size(config.trt_workspace_bytes)
+            .with_builder_optimization_level(config.trt_builder_optimization_level)
+            .with_force_sequential_engine_build(true)
+            .with_layer_norm_fp32_fallback(true)
+            .with_detailed_build_log(config.trt_detailed_build_log);
+        if config.trt_fp16 {
+            tensorrt = tensorrt.with_fp16(true);
+        }
+        if let Some(shapes) = shapes {
+            if let Some(min_shapes) =
+                tensorrt_profile(component, config, shapes, config.min_duration_s)
+            {
+                tensorrt = tensorrt.with_profile_min_shapes(min_shapes);
+            }
+            if let Some(opt_shapes) =
+                tensorrt_profile(component, config, shapes, config.opt_duration_s)
+            {
+                tensorrt = tensorrt.with_profile_opt_shapes(opt_shapes);
+            }
+            if let Some(max_shapes) =
+                tensorrt_profile(component, config, shapes, config.max_duration_s)
+            {
+                tensorrt = tensorrt.with_profile_max_shapes(max_shapes);
+            }
+        }
+        providers.push(tensorrt.build().fail_silently());
+    }
+
+    providers.push(
+        CUDAExecutionProvider::default()
+            .with_device_id(device_id as i32)
+            .build()
+            .error_on_failure(),
+    );
+    providers
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,6 +969,7 @@ impl SessionPool {
             let mdir = model_dir.as_ref().to_owned();
             let v = vocab.as_ref().to_owned();
             let c = config.clone();
+            let cache_dir = cache_dir.clone();
             let did = device_id;
             let sid = s;
 
@@ -880,43 +1075,86 @@ impl SessionPool {
                         "vocab loaded"
                     );
 
-                    let cuda = CUDAExecutionProvider::default()
-                        .with_device_id(did as i32)
-                        .build();
-                    let cpu = CPUExecutionProvider::default().build();
+                    let trt_available = TensorRTExecutionProvider::default()
+                        .is_available()
+                        .unwrap_or(false);
+                    info!(
+                        device = did,
+                        session = sid,
+                        trt_available,
+                        trt_components = %c.trt_components,
+                        "execution providers ready"
+                    );
 
-                    let enc = match session_from_provider(&enc_path, cuda.clone()) {
-                        Ok(s) => s,
-                        Err(e_cuda) => {
-                            warn!(
-                                device = did,
-                                session = sid,
-                                ?e_cuda,
-                                "CUDA encoder failed, falling back to CPU"
-                            );
-                            session_from_provider(&enc_path, cpu.clone())?
+                    let enc_shapes = if c.uses_tensorrt_for(ModelComponent::Encoder) {
+                        match input_shapes(&enc_path) {
+                            Ok(shapes) => Some(shapes),
+                            Err(error) => {
+                                warn!(
+                                    device = did,
+                                    session = sid,
+                                    error = %error,
+                                    "failed to inspect encoder shapes for TensorRT; continuing without explicit profiles"
+                                );
+                                None
+                            }
                         }
+                    } else {
+                        None
+                    };
+                    let joint_enc_shapes = if c.uses_tensorrt_for(ModelComponent::JointEnc) {
+                        match input_shapes(&joint_enc_path) {
+                            Ok(shapes) => Some(shapes),
+                            Err(error) => {
+                                warn!(
+                                    device = did,
+                                    session = sid,
+                                    error = %error,
+                                    "failed to inspect joint encoder shapes for TensorRT; continuing without explicit profiles"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
                     };
 
-                    let dec = match session_from_provider(&dec_path, cuda.clone()) {
-                        Ok(s) => s,
-                        Err(_) => session_from_provider(&dec_path, cpu.clone())?,
-                    };
+                    let enc = session_from_providers(
+                        &enc_path,
+                        provider_chain(
+                            ModelComponent::Encoder,
+                            did,
+                            &c,
+                            &cache_dir,
+                            enc_shapes.as_deref(),
+                        ),
+                    )?;
 
-                    let jenc = match session_from_provider(&joint_enc_path, cuda.clone()) {
-                        Ok(s) => s,
-                        Err(_) => session_from_provider(&joint_enc_path, cpu.clone())?,
-                    };
+                    let dec = session_from_providers(
+                        &dec_path,
+                        provider_chain(ModelComponent::Decoder, did, &c, &cache_dir, None),
+                    )?;
 
-                    let jpred = match session_from_provider(&joint_pred_path, cuda.clone()) {
-                        Ok(s) => s,
-                        Err(_) => session_from_provider(&joint_pred_path, cpu.clone())?,
-                    };
+                    let jenc = session_from_providers(
+                        &joint_enc_path,
+                        provider_chain(
+                            ModelComponent::JointEnc,
+                            did,
+                            &c,
+                            &cache_dir,
+                            joint_enc_shapes.as_deref(),
+                        ),
+                    )?;
 
-                    let jnet = match session_from_provider(&joint_net_path, cuda.clone()) {
-                        Ok(s) => s,
-                        Err(_) => session_from_provider(&joint_net_path, cpu.clone())?,
-                    };
+                    let jpred = session_from_providers(
+                        &joint_pred_path,
+                        provider_chain(ModelComponent::JointPred, did, &c, &cache_dir, None),
+                    )?;
+
+                    let jnet = session_from_providers(
+                        &joint_net_path,
+                        provider_chain(ModelComponent::JointNet, did, &c, &cache_dir, None),
+                    )?;
 
                     let mut engine = TdtEngine::new(
                         enc,

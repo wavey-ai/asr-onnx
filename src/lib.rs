@@ -146,6 +146,12 @@ impl Config {
                 self.trt_components = trimmed.to_string();
             }
         }
+        if let Ok(v) = std::env::var("ASR_ONNX_TRT_CACHE_DIR") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.trt_cache_dir = trimmed.to_string();
+            }
+        }
         if let Ok(v) = std::env::var("ASR_ONNX_TRT_WORKSPACE_BYTES") {
             if let Ok(n) = v.parse::<usize>() {
                 self.trt_workspace_bytes = n.max(1 << 20);

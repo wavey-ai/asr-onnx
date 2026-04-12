@@ -11,6 +11,7 @@ use ort::logging::LogLevel;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor as OrtTensor;
+use ort::value::ValueType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::{
@@ -42,6 +43,25 @@ fn session_from_provider(path: &Path, provider: ExecutionProviderDispatch) -> Re
         .map_err(ort_error)?
         .commit_from_file(path)
         .map_err(ort_error)
+}
+
+fn concrete_shape(value_type: &ValueType) -> Option<Vec<usize>> {
+    let shape = value_type.tensor_shape()?;
+    Some(
+        shape
+            .iter()
+            .map(|dim| if *dim > 0 { *dim as usize } else { 1 })
+            .collect(),
+    )
+}
+
+fn last_positive_dim(value_type: &ValueType) -> Option<usize> {
+    value_type
+        .tensor_shape()?
+        .iter()
+        .rev()
+        .find(|dim| **dim > 0)
+        .map(|dim| *dim as usize)
 }
 
 #[derive(Clone, Debug)]
@@ -445,6 +465,9 @@ struct TdtEngine {
     blank_id: usize,
     hidden_size: usize,
     vocab_len: usize,
+    state0_shape: Vec<usize>,
+    state1_shape: Vec<usize>,
+    joint_net_separate_inputs: bool,
 }
 
 impl TdtEngine {
@@ -457,6 +480,34 @@ impl TdtEngine {
         blank_id: usize,
         vocab_len: usize,
     ) -> Self {
+        let hidden_size = decoder
+            .inputs()
+            .get(2)
+            .and_then(|input| last_positive_dim(input.dtype()))
+            .or_else(|| {
+                joint_net
+                    .inputs()
+                    .first()
+                    .and_then(|input| last_positive_dim(input.dtype()))
+            })
+            .or_else(|| {
+                joint_pred
+                    .outputs()
+                    .first()
+                    .and_then(|output| last_positive_dim(output.dtype()))
+            })
+            .unwrap_or(640);
+        let state0_shape = decoder
+            .inputs()
+            .get(2)
+            .and_then(|input| concrete_shape(input.dtype()))
+            .unwrap_or_else(|| vec![2, 1, hidden_size]);
+        let state1_shape = decoder
+            .inputs()
+            .get(3)
+            .and_then(|input| concrete_shape(input.dtype()))
+            .unwrap_or_else(|| vec![2, 1, hidden_size]);
+        let joint_net_separate_inputs = joint_net.inputs().len() >= 2;
         Self {
             encoder,
             decoder,
@@ -464,8 +515,11 @@ impl TdtEngine {
             joint_enc,
             joint_net,
             blank_id,
-            hidden_size: 640,
+            hidden_size,
             vocab_len,
+            state0_shape,
+            state1_shape,
+            joint_net_separate_inputs,
         }
     }
 
@@ -484,9 +538,10 @@ impl TdtEngine {
         let flat: Vec<f32> = features.iter().cloned().collect();
         let audio_signal = OrtTensor::from_array(([1, rows as i64, cols as i64], flat))?;
         let outputs = self.encoder.run([audio_signal.into(), length.into()])?;
-        let enc = outputs
-            .get("outputs")
-            .ok_or_else(|| anyhow::anyhow!("missing encoder output"))?;
+        if outputs.len() == 0 {
+            bail!("missing encoder output");
+        }
+        let enc = &outputs[0];
         let arr = enc.try_extract_array::<f32>()?;
         let arr3: Array3<f32> = arr.into_owned().into_dimensionality::<Ix3>()?;
         Ok(arr3.permuted_axes([0, 2, 1]))
@@ -494,11 +549,12 @@ impl TdtEngine {
 
     fn joint_enc_infer(&mut self, encoder_output: &Array3<f32>) -> Result<ArrayD<f32>> {
         let encoder_view = encoder_output.view().into_dyn();
-        let inputs = ort::inputs!["input" => OrtTensor::from_array(encoder_view.to_owned())?];
-        let outputs = self.joint_enc.run(inputs)?;
-        let out = outputs
-            .get("output")
-            .ok_or_else(|| anyhow::anyhow!("missing joint_enc output"))?;
+        let tensor = OrtTensor::from_array(encoder_view.to_owned())?;
+        let outputs = self.joint_enc.run([tensor.into()])?;
+        if outputs.len() == 0 {
+            bail!("missing joint_enc output");
+        }
+        let out = &outputs[0];
         Ok(out.try_extract_array::<f32>()?.to_owned())
     }
 
@@ -508,24 +564,24 @@ impl TdtEngine {
         state0: &ArrayD<f32>,
         state1: &ArrayD<f32>,
     ) -> Result<(ArrayD<f32>, ArrayD<f32>, ArrayD<f32>)> {
-        let inputs = ort::inputs![
-            "targets" => OrtTensor::from_array(([1, 1], vec![target as i32]))?,
-            "target_length" => OrtTensor::from_array(([1], vec![1i32]))?,
-            "states.1" => OrtTensor::from_array(state0.clone())?,
-            "onnx::Slice_3" => OrtTensor::from_array(state1.clone())?,
-        ];
-        let outputs = self.decoder.run(inputs)?;
-        let out = outputs
-            .get("outputs")
-            .ok_or_else(|| anyhow::anyhow!("missing decoder outputs"))?;
+        let targets = OrtTensor::from_array(([1, 1], vec![target as i32]))?;
+        let target_length = OrtTensor::from_array(([1], vec![1i32]))?;
+        let state0 = OrtTensor::from_array(state0.clone())?;
+        let state1 = OrtTensor::from_array(state1.clone())?;
+        let outputs = self.decoder.run([
+            targets.into(),
+            target_length.into(),
+            state0.into(),
+            state1.into(),
+        ])?;
+        if outputs.len() < 4 {
+            bail!("decoder output count {} too small", outputs.len());
+        }
+        let out = &outputs[0];
         let mut dec = out.try_extract_array::<f32>()?;
         dec = dec.permuted_axes(IxDyn(&[0, 2, 1]));
-        let s0 = outputs
-            .get("states")
-            .ok_or_else(|| anyhow::anyhow!("missing decoder state0"))?;
-        let s1 = outputs
-            .get("162")
-            .ok_or_else(|| anyhow::anyhow!("missing decoder state1"))?;
+        let s0 = &outputs[2];
+        let s1 = &outputs[3];
         Ok((
             dec.to_owned(),
             s0.try_extract_array::<f32>()?.to_owned(),
@@ -534,24 +590,33 @@ impl TdtEngine {
     }
 
     fn joint_pred_infer(&mut self, decoder_output: &ArrayD<f32>) -> Result<ArrayD<f32>> {
-        let inputs =
-            ort::inputs!["onnx::MatMul_0" => OrtTensor::from_array(decoder_output.clone())?];
-        let outputs = self.joint_pred.run(inputs)?;
-        let out = outputs
-            .get("5")
-            .ok_or_else(|| anyhow::anyhow!("missing joint_pred output"))?;
+        let input = OrtTensor::from_array(decoder_output.clone())?;
+        let outputs = self.joint_pred.run([input.into()])?;
+        if outputs.len() == 0 {
+            bail!("missing joint_pred output");
+        }
+        let out = &outputs[0];
         Ok(out.try_extract_array::<f32>()?.to_owned())
     }
 
     fn joint_net_infer(&mut self, f: &ArrayD<f32>, g: &ArrayD<f32>) -> Result<ArrayD<f32>> {
-        let ff = f.to_shape(IxDyn(&[1, 1, 1, self.hidden_size]))?;
-        let gg = g.to_shape(IxDyn(&[1, 1, 1, self.hidden_size]))?;
-        let input = &ff + &gg;
-        let inputs = ort::inputs!["input.1" => OrtTensor::from_array(input.to_owned())?];
-        let outputs = self.joint_net.run(inputs)?;
-        let out = outputs
-            .get("6")
-            .ok_or_else(|| anyhow::anyhow!("missing joint_net output"))?;
+        let outputs = if self.joint_net_separate_inputs {
+            let ff = f.to_shape(IxDyn(&[1, 1, self.hidden_size]))?;
+            let gg = g.to_shape(IxDyn(&[1, 1, self.hidden_size]))?;
+            let f_input = OrtTensor::from_array(ff.to_owned())?;
+            let g_input = OrtTensor::from_array(gg.to_owned())?;
+            self.joint_net.run([f_input.into(), g_input.into()])?
+        } else {
+            let ff = f.to_shape(IxDyn(&[1, 1, 1, self.hidden_size]))?;
+            let gg = g.to_shape(IxDyn(&[1, 1, 1, self.hidden_size]))?;
+            let input = &ff + &gg;
+            let input = OrtTensor::from_array(input.to_owned())?;
+            self.joint_net.run([input.into()])?
+        };
+        if outputs.len() == 0 {
+            bail!("missing joint_net output");
+        }
+        let out = &outputs[0];
         let res = out.try_extract_array::<f32>()?;
         Self::log_softmax(&res)
     }
@@ -571,8 +636,8 @@ impl AsrEngine for TdtEngine {
         let encoder_output_projected = self.joint_enc_infer(&encoder_output)?;
         let gpu_ms = start.elapsed().as_secs_f64() * 1e3;
 
-        let mut state0 = ArrayD::zeros(IxDyn(&[2, 1, self.hidden_size]));
-        let mut state1 = ArrayD::zeros(IxDyn(&[2, 1, self.hidden_size]));
+        let mut state0 = ArrayD::zeros(IxDyn(&self.state0_shape));
+        let mut state1 = ArrayD::zeros(IxDyn(&self.state1_shape));
 
         let mut ids: Vec<usize> = Vec::new();
         let mut emits: Vec<usize> = Vec::new();

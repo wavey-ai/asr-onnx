@@ -56,7 +56,10 @@ fn test_transcribe_all_npy() -> Result<()> {
     }
 
     for (name, mel) in &feats {
-        let meta = JobMeta { seq: 0, chunk_id: 0 };
+        let meta = JobMeta {
+            seq: 0,
+            chunk_id: 0,
+        };
         pool.submit(name.clone(), mel.clone(), meta)?;
     }
 

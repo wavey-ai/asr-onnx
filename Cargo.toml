@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
-ndarray = "0.16.1"
-ort = { git = "https://github.com/pykeio/ort.git", features = [
+ndarray = "0.17.2"
+ort = { git = "https://github.com/pykeio/ort.git", rev = "8724e89ff005ebef4339d7280ff592837404a98d", features = [
     "tensorrt",
     "cuda",
 ] }

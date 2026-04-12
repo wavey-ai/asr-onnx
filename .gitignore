@@ -2,3 +2,5 @@
 /trt_cache/*
 /model/*.onnx
 /testdata/
+__pycache__/
+*.pyc

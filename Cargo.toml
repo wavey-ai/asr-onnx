@@ -6,7 +6,15 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 ndarray = "0.17.2"
-ort = { git = "https://github.com/pykeio/ort.git", rev = "8724e89ff005ebef4339d7280ff592837404a98d", features = [
+ort = { git = "https://github.com/pykeio/ort.git", rev = "8724e89ff005ebef4339d7280ff592837404a98d", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-native",
+    "copy-dylibs",
+    "api-24",
+    "load-dynamic",
     "tensorrt",
     "cuda",
 ] }

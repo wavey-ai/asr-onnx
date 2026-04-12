@@ -16,10 +16,11 @@ use ort::value::ValueType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::{
+    env,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -27,8 +28,85 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
 fn ort_error<E: std::fmt::Display>(error: E) -> anyhow::Error {
     anyhow::anyhow!(error.to_string())
+}
+
+fn ort_runtime_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for key in ["ASR_ONNX_RUNTIME_LIB", "ORT_DYLIB_PATH"] {
+        if let Ok(value) = env::var(key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                candidates.push(path);
+            }
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("libonnxruntime.so"));
+            candidates.push(dir.join("deps").join("libonnxruntime.so"));
+            candidates.push(dir.join("lib").join("libonnxruntime.so"));
+        }
+    }
+
+    candidates.push(PathBuf::from("/usr/local/lib/libonnxruntime.so"));
+    candidates.push(PathBuf::from("/usr/lib/x86_64-linux-gnu/libonnxruntime.so"));
+
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for path in candidates {
+        if seen.insert(path.clone()) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+fn ensure_ort_initialized() -> Result<()> {
+    let result = ORT_INIT.get_or_init(|| {
+        let mut errors = Vec::new();
+        for candidate in ort_runtime_candidates() {
+            if !candidate.exists() {
+                continue;
+            }
+
+            match ort::init_from(&candidate) {
+                Ok(builder) => {
+                    let created = builder.commit();
+                    info!(
+                        path = %candidate.display(),
+                        created,
+                        "loaded ONNX Runtime dynamically"
+                    );
+                    return Ok(());
+                }
+                Err(error) => errors.push(format!(
+                    "{}: {}",
+                    candidate.display(),
+                    error
+                )),
+            }
+        }
+
+        if errors.is_empty() {
+            Err("failed to locate libonnxruntime.so; set ASR_ONNX_RUNTIME_LIB or ORT_DYLIB_PATH".to_string())
+        } else {
+            Err(format!(
+                "failed to initialize libonnxruntime.so: {}",
+                errors.join(" | ")
+            ))
+        }
+    });
+
+    result
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))?;
+    Ok(())
 }
 
 fn session_from_provider(path: &Path, provider: ExecutionProviderDispatch) -> Result<Session> {
@@ -961,6 +1039,8 @@ impl SessionPool {
         device_id: usize,
         config: Config,
     ) -> Result<Self> {
+        ensure_ort_initialized()?;
+
         let (tx_infer, rx_infer) = bounded::<TranscriptionJob>(4096);
         let (tx_res, rx_res) = bounded::<TranscriptionResult>(4096);
         let (ready_tx, ready_rx) = bounded::<()>(1024);

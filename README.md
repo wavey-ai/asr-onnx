@@ -64,6 +64,27 @@ The exporter writes:
 
 The featurizer trace remains in `asr-torch`; this repo only handles the ONNX side of the pipeline.
 
+### Export Cohere Transcribe ONNX graphs
+
+The Cohere export path writes the encoder and decoder graphs used during the ONNX spike work:
+
+- `encoder.onnx`
+- `decoder_last_token.onnx`
+- `decoder_prefill.onnx`
+- `decoder_cached_step.onnx`
+- `export.json`
+
+Example:
+
+```bash
+python3 export/export_cohere_transcribe.py \
+  --source CohereLabs/cohere-transcribe-03-2026 \
+  --output-dir model/cohere-transcribe-03-2026 \
+  --device cuda
+```
+
+The model is gated on Hugging Face, so the export host must already be authenticated for `CohereLabs/cohere-transcribe-03-2026`.
+
 ### Recreate the export environment
 
 The exact GPU export environment used on `scratch-fm-gpu-de-fra-2-1` is checked in at:

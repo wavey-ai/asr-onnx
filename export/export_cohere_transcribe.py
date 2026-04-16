@@ -14,6 +14,24 @@ from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutput
 
 
+def _cache_layer_tensors(cache: DynamicCache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if hasattr(cache, "layers"):
+        layer = cache.layers[layer_idx]
+        return layer.keys, layer.values
+    return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+
+
+def _dynamic_cache_from_tensors(keys: list[torch.Tensor], values: list[torch.Tensor]) -> DynamicCache:
+    if hasattr(DynamicCache, "from_legacy_cache"):
+        legacy_cache = tuple((key, value) for key, value in zip(keys, values))
+        return DynamicCache.from_legacy_cache(legacy_cache)
+
+    cache = DynamicCache()
+    cache.key_cache = list(keys)
+    cache.value_cache = list(values)
+    return cache
+
+
 class CohereDecoderOnlyWrapper(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -92,12 +110,14 @@ class CohereDecoderPrefillWrapper(nn.Module):
 
         flat_outputs: list[torch.Tensor] = [logits]
         for layer_idx in range(self.num_layers):
+            self_key, self_value = _cache_layer_tensors(updated_cache.self_attention_cache, layer_idx)
+            cross_key, cross_value = _cache_layer_tensors(updated_cache.cross_attention_cache, layer_idx)
             flat_outputs.extend(
                 [
-                    updated_cache.self_attention_cache.key_cache[layer_idx],
-                    updated_cache.self_attention_cache.value_cache[layer_idx],
-                    updated_cache.cross_attention_cache.key_cache[layer_idx],
-                    updated_cache.cross_attention_cache.value_cache[layer_idx],
+                    self_key,
+                    self_value,
+                    cross_key,
+                    cross_value,
                 ]
             )
         return tuple(flat_outputs)
@@ -117,13 +137,8 @@ class CohereDecoderCachedStepWrapper(nn.Module):
         cross_keys: list[torch.Tensor],
         cross_values: list[torch.Tensor],
     ) -> EncoderDecoderCache:
-        self_cache = DynamicCache()
-        self_cache.key_cache = list(self_keys)
-        self_cache.value_cache = list(self_values)
-
-        cross_cache = DynamicCache()
-        cross_cache.key_cache = list(cross_keys)
-        cross_cache.value_cache = list(cross_values)
+        self_cache = _dynamic_cache_from_tensors(self_keys, self_values)
+        cross_cache = _dynamic_cache_from_tensors(cross_keys, cross_values)
 
         cache = EncoderDecoderCache(self_cache, cross_cache)
         for layer_idx in range(self.num_layers):
@@ -188,10 +203,11 @@ class CohereDecoderCachedStepWrapper(nn.Module):
 
         flat_outputs: list[torch.Tensor] = [logits]
         for layer_idx in range(self.num_layers):
+            self_key, self_value = _cache_layer_tensors(updated_cache.self_attention_cache, layer_idx)
             flat_outputs.extend(
                 [
-                    updated_cache.self_attention_cache.key_cache[layer_idx],
-                    updated_cache.self_attention_cache.value_cache[layer_idx],
+                    self_key,
+                    self_value,
                 ]
             )
         return tuple(flat_outputs)
@@ -291,6 +307,7 @@ def export_onnx(
             inputs,
             str(path),
             opset_version=opset,
+            dynamo=False,
             export_params=True,
             external_data=True,
             input_names=input_names,

@@ -462,7 +462,7 @@ def prepare_sample_inputs(
     language: str,
     seconds: float,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> tuple[str, dict[str, torch.Tensor]]:
     sample_rate = int(processor.feature_extractor.sampling_rate)
     waveform = np.zeros((max(1, int(round(sample_rate * seconds))),), dtype=np.float32)
     prompt_text = model.build_prompt(language=language, punctuation=True)
@@ -473,7 +473,7 @@ def prepare_sample_inputs(
         return_tensors="pt",
     )
     sample = sanitize_inputs(processor.tokenizer, sample)
-    return {name: value.to(device) for name, value in sample.items()}
+    return prompt_text, {name: value.to(device) for name, value in sample.items()}
 
 
 def main() -> int:
@@ -484,7 +484,9 @@ def main() -> int:
 
     processor = AutoProcessor.from_pretrained(args.source, trust_remote_code=True)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(args.source, trust_remote_code=True).to(device).eval()
-    sample = prepare_sample_inputs(
+    processor.save_pretrained(output_dir)
+    model.config.save_pretrained(output_dir)
+    prompt_text, sample = prepare_sample_inputs(
         model=model,
         processor=processor,
         language=args.language,
@@ -561,9 +563,16 @@ def main() -> int:
     )
     metadata = {
         "format_version": 1,
+        "model_family": "cohere-transcribe-seq2seq",
         "source": args.source,
         "device": str(device),
         "language": args.language,
+        "prompt_text": prompt_text,
+        "prompt_token_ids": sample["decoder_input_ids"][0].detach().cpu().tolist(),
+        "bos_token_id": processor.tokenizer.bos_token_id,
+        "eos_token_id": processor.tokenizer.eos_token_id,
+        "pad_token_id": processor.tokenizer.pad_token_id,
+        "decoder_start_token_id": getattr(model.config, "decoder_start_token_id", None),
         "sample_audio_seconds": args.sample_audio_seconds,
         "opset": args.opset,
         "decoder_num_layers": decoder_num_layers,

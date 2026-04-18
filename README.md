@@ -72,6 +72,9 @@ The Cohere export path writes the encoder and decoder graphs used during the ONN
 - `decoder_last_token.onnx`
 - `decoder_prefill.onnx`
 - `decoder_cached_step.onnx`
+- Hugging Face tokenizer / processor metadata
+- model config JSON
+- prompt / token IDs in `export.json`
 - `export.json`
 
 Example:
@@ -84,6 +87,44 @@ python3 export/export_cohere_transcribe.py \
 ```
 
 The model is gated on Hugging Face, so the export host must already be authenticated for `CohereLabs/cohere-transcribe-03-2026`.
+
+This export path does not mean the current Rust runtime can already serve Cohere. `asr-onnx` still only executes the split TDT bundle (`encoder` / `decoder` / `joint.*`) at runtime today.
+
+### Export a staged Cohere bundle
+
+If you want one bundle directory for the standalone Linux box, use the wrapper:
+
+```bash
+python3 export/export_cohere_bundle.py \
+  --source CohereLabs/cohere-transcribe-03-2026 \
+  --output-dir ../asr-api/models/cohere-transcribe-03-2026 \
+  --device cuda \
+  --num-devices 1
+```
+
+This stages:
+
+- the Cohere ONNX encoder / decoder graphs
+- Hugging Face processor / tokenizer metadata
+- model config JSON
+- `frontend_export.json` and, when traceable, `frontend.onnx`
+- `featurizer_cuda*.pt` and `trace_report.json` when the frontend trace succeeds
+- `bundle_export.json`
+- a refreshed `SHA256SUMS`
+
+Use `--skip-featurizer` or `--skip-frontend` if you only want part of the bundle.
+
+### Export Cohere frontend assets
+
+Use the frontend exporter to save the Hugging Face processor/tokenizer/config next to the ONNX graphs and to attempt a waveform frontend export:
+
+```bash
+python3 export/export_cohere_frontend.py \
+  --source CohereLabs/cohere-transcribe-03-2026 \
+  --output-dir model/cohere-transcribe-03-2026
+```
+
+The script always writes `frontend_export.json`. If the Cohere frontend resolves to a traceable Torch module, it also writes `frontend.onnx`. If not, the report captures that the frontend is still Python-only.
 
 ### Recreate the export environment
 

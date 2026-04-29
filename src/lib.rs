@@ -3,24 +3,20 @@ use bincode::config;
 use bincode::serde::{decode_from_slice, encode_to_vec};
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use ndarray::{Array2, Array3, ArrayD, Ix3, IxDyn, s};
-use ort::execution_providers::{
-    CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider, ExecutionProviderDispatch,
-    TensorRTExecutionProvider,
+use gpu_worker_ort::{
+    CUDAExecutionProvider, ExecutionProvider, ExecutionProviderDispatch, GraphOptimizationLevel,
+    LogLevel, OrtTensor, Session, SessionConfig, TensorRT, TensorRtProviderOptions, build_session,
+    concrete_shape, cpu_provider, cuda_provider, ensure_dynamic_runtime_from_env,
+    last_positive_dim, tensorrt_provider,
 };
-use ort::logging::LogLevel;
-use ort::session::Session;
-use ort::session::builder::GraphOptimizationLevel;
-use ort::value::Tensor as OrtTensor;
-use ort::value::ValueType;
+use ndarray::{Array2, Array3, ArrayD, Ix3, IxDyn, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::{
-    env,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -28,85 +24,8 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
-static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-
-fn ort_error<E: std::fmt::Display>(error: E) -> anyhow::Error {
-    anyhow::anyhow!(error.to_string())
-}
-
-fn ort_runtime_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    for key in ["ASR_ONNX_RUNTIME_LIB", "ORT_DYLIB_PATH"] {
-        if let Ok(value) = env::var(key) {
-            let path = PathBuf::from(value);
-            if !path.as_os_str().is_empty() {
-                candidates.push(path);
-            }
-        }
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("libonnxruntime.so"));
-            candidates.push(dir.join("deps").join("libonnxruntime.so"));
-            candidates.push(dir.join("lib").join("libonnxruntime.so"));
-        }
-    }
-
-    candidates.push(PathBuf::from("/usr/local/lib/libonnxruntime.so"));
-    candidates.push(PathBuf::from("/usr/lib/x86_64-linux-gnu/libonnxruntime.so"));
-
-    let mut unique = Vec::new();
-    let mut seen = HashSet::new();
-    for path in candidates {
-        if seen.insert(path.clone()) {
-            unique.push(path);
-        }
-    }
-    unique
-}
-
 fn ensure_ort_initialized() -> Result<()> {
-    let result = ORT_INIT.get_or_init(|| {
-        let mut errors = Vec::new();
-        for candidate in ort_runtime_candidates() {
-            if !candidate.exists() {
-                continue;
-            }
-
-            match ort::init_from(&candidate) {
-                Ok(builder) => {
-                    let created = builder.commit();
-                    info!(
-                        path = %candidate.display(),
-                        created,
-                        "loaded ONNX Runtime dynamically"
-                    );
-                    return Ok(());
-                }
-                Err(error) => errors.push(format!(
-                    "{}: {}",
-                    candidate.display(),
-                    error
-                )),
-            }
-        }
-
-        if errors.is_empty() {
-            Err("failed to locate libonnxruntime.so; set ASR_ONNX_RUNTIME_LIB or ORT_DYLIB_PATH".to_string())
-        } else {
-            Err(format!(
-                "failed to initialize libonnxruntime.so: {}",
-                errors.join(" | ")
-            ))
-        }
-    });
-
-    result
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!(error.clone()))?;
-    Ok(())
+    ensure_dynamic_runtime_from_env(&["ASR_ONNX_RUNTIME_LIB", "ORT_DYLIB_PATH"])
 }
 
 fn session_from_provider(path: &Path, provider: ExecutionProviderDispatch) -> Result<Session> {
@@ -117,37 +36,11 @@ fn session_from_providers(
     path: &Path,
     providers: impl AsRef<[ExecutionProviderDispatch]>,
 ) -> Result<Session> {
-    Session::builder()
-        .map_err(ort_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(ort_error)?
-        .with_log_level(LogLevel::Info)
-        .map_err(ort_error)?
-        .with_execution_providers(providers)
-        .map_err(ort_error)?
-        .with_intra_threads(1)
-        .map_err(ort_error)?
-        .commit_from_file(path)
-        .map_err(ort_error)
-}
-
-fn concrete_shape(value_type: &ValueType) -> Option<Vec<usize>> {
-    let shape = value_type.tensor_shape()?;
-    Some(
-        shape
-            .iter()
-            .map(|dim| if *dim > 0 { *dim as usize } else { 1 })
-            .collect(),
+    build_session(
+        path,
+        providers,
+        &SessionConfig::new(GraphOptimizationLevel::Level3, LogLevel::Info, 1),
     )
-}
-
-fn last_positive_dim(value_type: &ValueType) -> Option<usize> {
-    value_type
-        .tensor_shape()?
-        .iter()
-        .rev()
-        .find(|dim| **dim > 0)
-        .map(|dim| *dim as usize)
 }
 
 #[derive(Clone, Debug)]
@@ -244,8 +137,7 @@ impl Config {
             self.trt_fp16 = matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
         }
         if let Ok(v) = std::env::var("ASR_ONNX_TRT_DETAILED_BUILD_LOG") {
-            self.trt_detailed_build_log =
-                matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
+            self.trt_detailed_build_log = matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
         }
         self
     }
@@ -307,7 +199,7 @@ fn encoded_steps_for(seq_len: usize, subsampling_factor: usize) -> usize {
 }
 
 fn input_shapes(path: &Path) -> Result<Vec<(String, Vec<usize>)>> {
-    let session = session_from_provider(path, CPUExecutionProvider::default().build())?;
+    let session = session_from_provider(path, cpu_provider())?;
     Ok(session
         .inputs()
         .iter()
@@ -375,52 +267,36 @@ fn provider_chain(
     config: &Config,
     cache_dir: &str,
     shapes: Option<&[(String, Vec<usize>)]>,
-) -> Vec<ExecutionProviderDispatch> {
+) -> Result<Vec<ExecutionProviderDispatch>> {
     let mut providers = Vec::new();
 
     if config.uses_tensorrt_for(component) {
-        let mut tensorrt = TensorRTExecutionProvider::default()
-            .with_device_id(device_id as i32)
-            .with_engine_cache(true)
-            .with_engine_cache_path(cache_dir)
-            .with_engine_cache_prefix(component.cache_prefix())
-            .with_timing_cache(true)
-            .with_timing_cache_path(cache_dir)
-            .with_max_workspace_size(config.trt_workspace_bytes)
-            .with_builder_optimization_level(config.trt_builder_optimization_level)
-            .with_force_sequential_engine_build(true)
-            .with_layer_norm_fp32_fallback(true)
-            .with_detailed_build_log(config.trt_detailed_build_log);
-        if config.trt_fp16 {
-            tensorrt = tensorrt.with_fp16(true);
-        }
-        if let Some(shapes) = shapes {
-            if let Some(min_shapes) =
+        let options = TensorRtProviderOptions {
+            device_id: device_id as i32,
+            fp16: config.trt_fp16,
+            engine_cache_path: Some(cache_dir.into()),
+            engine_cache_prefix: Some(component.cache_prefix().to_string()),
+            timing_cache_path: Some(cache_dir.into()),
+            profile_min_shapes: shapes.and_then(|shapes| {
                 tensorrt_profile(component, config, shapes, config.min_duration_s)
-            {
-                tensorrt = tensorrt.with_profile_min_shapes(min_shapes);
-            }
-            if let Some(opt_shapes) =
+            }),
+            profile_opt_shapes: shapes.and_then(|shapes| {
                 tensorrt_profile(component, config, shapes, config.opt_duration_s)
-            {
-                tensorrt = tensorrt.with_profile_opt_shapes(opt_shapes);
-            }
-            if let Some(max_shapes) =
+            }),
+            profile_max_shapes: shapes.and_then(|shapes| {
                 tensorrt_profile(component, config, shapes, config.max_duration_s)
-            {
-                tensorrt = tensorrt.with_profile_max_shapes(max_shapes);
-            }
-        }
-        providers.push(tensorrt.build().fail_silently());
+            }),
+            max_workspace_size: Some(config.trt_workspace_bytes),
+            builder_optimization_level: Some(config.trt_builder_optimization_level),
+            force_sequential_engine_build: true,
+            layer_norm_fp32_fallback: true,
+            detailed_build_log: config.trt_detailed_build_log,
+        };
+        providers.push(tensorrt_provider(&options, true)?);
     }
 
-    providers.push(
-        CUDAExecutionProvider::default()
-            .with_device_id(device_id as i32)
-            .build()
-            .error_on_failure(),
-    );
-    providers
+    providers.push(cuda_provider(device_id as i32, true));
+    Ok(providers)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1161,9 +1037,7 @@ impl SessionPool {
                         "vocab loaded"
                     );
 
-                    let trt_available = TensorRTExecutionProvider::default()
-                        .is_available()
-                        .unwrap_or(false);
+                    let trt_available = TensorRT::default().is_available().unwrap_or(false);
                     info!(
                         device = did,
                         session = sid,
@@ -1213,12 +1087,12 @@ impl SessionPool {
                             &c,
                             &cache_dir,
                             enc_shapes.as_deref(),
-                        ),
+                        )?,
                     )?;
 
                     let dec = session_from_providers(
                         &dec_path,
-                        provider_chain(ModelComponent::Decoder, did, &c, &cache_dir, None),
+                        provider_chain(ModelComponent::Decoder, did, &c, &cache_dir, None)?,
                     )?;
 
                     let jenc = session_from_providers(
@@ -1229,17 +1103,17 @@ impl SessionPool {
                             &c,
                             &cache_dir,
                             joint_enc_shapes.as_deref(),
-                        ),
+                        )?,
                     )?;
 
                     let jpred = session_from_providers(
                         &joint_pred_path,
-                        provider_chain(ModelComponent::JointPred, did, &c, &cache_dir, None),
+                        provider_chain(ModelComponent::JointPred, did, &c, &cache_dir, None)?,
                     )?;
 
                     let jnet = session_from_providers(
                         &joint_net_path,
-                        provider_chain(ModelComponent::JointNet, did, &c, &cache_dir, None),
+                        provider_chain(ModelComponent::JointNet, did, &c, &cache_dir, None)?,
                     )?;
 
                     let mut engine = TdtEngine::new(

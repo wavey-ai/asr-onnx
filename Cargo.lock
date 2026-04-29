@@ -41,6 +41,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "edit-distance",
+ "gpu-worker-ort",
  "ndarray 0.17.2",
  "ndarray-npy",
  "ort",
@@ -324,6 +325,14 @@ dependencies = [
  "libc",
  "r-efi",
  "wasi",
+]
+
+[[package]]
+name = "gpu-worker-ort"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ort",
 ]
 
 [[package]]

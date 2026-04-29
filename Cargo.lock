@@ -330,6 +330,7 @@ dependencies = [
 [[package]]
 name = "gpu-worker-ort"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/gpu-workers.git?rev=d7fcea671a28854d263a3eb06a2be629de98af43#d7fcea671a28854d263a3eb06a2be629de98af43"
 dependencies = [
  "anyhow",
  "ort",

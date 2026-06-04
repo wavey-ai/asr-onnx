@@ -63,6 +63,7 @@ pub struct Config {
     pub subsampling_factor: usize,
     pub max_symbols_per_step: usize,
     pub force_ctc: bool,
+    pub force_cpu: bool,
 }
 
 impl Default for Config {
@@ -86,6 +87,7 @@ impl Default for Config {
             subsampling_factor: 8,
             max_symbols_per_step: 10,
             force_ctc: false,
+            force_cpu: false,
         }
     }
 }
@@ -138,6 +140,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("ASR_ONNX_TRT_DETAILED_BUILD_LOG") {
             self.trt_detailed_build_log = matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+        if let Ok(v) = std::env::var("ASR_ONNX_FORCE_CPU") {
+            self.force_cpu = matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES");
         }
         self
     }
@@ -268,6 +273,10 @@ fn provider_chain(
     cache_dir: &str,
     shapes: Option<&[(String, Vec<usize>)]>,
 ) -> Result<Vec<ExecutionProviderDispatch>> {
+    if config.force_cpu {
+        return Ok(vec![cpu_provider()]);
+    }
+
     let mut providers = Vec::new();
 
     if config.uses_tensorrt_for(component) {
@@ -943,10 +952,10 @@ impl SessionPool {
                         bail!("TDT requires a model directory with component ONNX files");
                     }
 
-                    // TDT models require CUDA Execution Provider; abort early if unavailable
-                    if !CUDAExecutionProvider::default()
-                        .is_available()
-                        .unwrap_or(false)
+                    if !c.force_cpu
+                        && !CUDAExecutionProvider::default()
+                            .is_available()
+                            .unwrap_or(false)
                     {
                         panic!(
                             "CUDA Execution Provider not available: TDT models require CUDA-enabled ONNX Runtime"

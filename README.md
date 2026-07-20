@@ -62,7 +62,7 @@ The exporter writes:
 - `vocab.txt`
 - `export.json`
 
-The featurizer trace remains in `asr-torch`; this repo only handles the ONNX side of the pipeline.
+The featurizer trace remains in `asr-torch`. This repo only handles the ONNX side of the pipeline.
 
 ### Export Cohere Transcribe ONNX graphs
 
@@ -138,4 +138,4 @@ Bootstrap it with:
 ./python/setup-export-env.sh
 ```
 
-That creates `.venv-export` and installs the pinned Python package set used for the ONNX asset export. The lockfile is a sanitized freeze of the working host environment; it intentionally omits unrelated editable local packages.
+That creates `.venv-export` and installs the pinned Python package set used for the ONNX asset export. The lockfile is a sanitized freeze of the working host environment. It intentionally omits unrelated editable local packages.

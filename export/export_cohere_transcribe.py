@@ -13,6 +13,8 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutput
 
+from processor_compat import save_processor_pretrained
+
 
 def _cache_layer_tensors(cache: DynamicCache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
     if hasattr(cache, "layers"):
@@ -484,7 +486,7 @@ def main() -> int:
 
     processor = AutoProcessor.from_pretrained(args.source, trust_remote_code=True)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(args.source, trust_remote_code=True).to(device).eval()
-    processor.save_pretrained(output_dir)
+    save_processor_pretrained(processor, output_dir)
     model.config.save_pretrained(output_dir)
     prompt_text, sample = prepare_sample_inputs(
         model=model,

@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
+from processor_compat import save_processor_pretrained
+
 
 DEFAULT_SOURCE = "CohereLabs/cohere-transcribe-03-2026"
 
@@ -294,7 +296,7 @@ def main() -> int:
     sample_rate = int(processor.feature_extractor.sampling_rate)
     prompt_text = build_prompt_text(model, args.language)
 
-    processor.save_pretrained(output_dir)
+    save_processor_pretrained(processor, output_dir)
     model.config.save_pretrained(output_dir)
 
     report: dict[str, Any] = {

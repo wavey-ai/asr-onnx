@@ -13,9 +13,48 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+from transformers.convert_slow_tokenizer import SpmConverter
 from transformers.modeling_outputs import BaseModelOutput
 
 from processor_compat import save_processor_pretrained
+
+
+class CohereTokenizerConverter(SpmConverter):
+    handle_byte_fallback = True
+
+    def pre_tokenizer(self, replacement: str, add_prefix_space: bool) -> Any:
+        return super().pre_tokenizer(replacement, True)
+
+    def decoder(self, replacement: str, add_prefix_space: bool) -> Any:
+        return super().decoder(replacement, True)
+
+
+def save_runtime_tokenizer(processor: Any, output_dir: Path) -> None:
+    tokenizer_model = output_dir / "tokenizer.model"
+    if not tokenizer_model.is_file():
+        raise FileNotFoundError(f"processor export did not create {tokenizer_model}")
+
+    tokenizer = processor.tokenizer
+    had_vocab_file = hasattr(tokenizer, "vocab_file")
+    previous_vocab_file = getattr(tokenizer, "vocab_file", None)
+    tokenizer.vocab_file = str(tokenizer_model)
+    try:
+        runtime_tokenizer = CohereTokenizerConverter(tokenizer).converted()
+    finally:
+        if had_vocab_file:
+            tokenizer.vocab_file = previous_vocab_file
+        else:
+            del tokenizer.vocab_file
+
+    sample_text = "Audio café — hello world."
+    sample_ids = tokenizer.encode(sample_text, add_special_tokens=False)
+    expected_text = tokenizer.decode(sample_ids, skip_special_tokens=True)
+    actual_text = runtime_tokenizer.decode(sample_ids, skip_special_tokens=True)
+    if actual_text != expected_text:
+        raise ValueError(
+            "the exported runtime tokenizer does not match the source tokenizer"
+        )
+    runtime_tokenizer.save(str(output_dir / "tokenizer.json"))
 
 
 def _cache_layer_tensors(cache: DynamicCache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -508,6 +547,8 @@ def main() -> int:
     model = AutoModelForSpeechSeq2Seq.from_pretrained(args.source, trust_remote_code=True).to(device).eval()
     save_processor_pretrained(processor, output_dir)
     model.config.save_pretrained(output_dir)
+    model.generation_config.save_pretrained(output_dir)
+    save_runtime_tokenizer(processor, output_dir)
     prompt_text, sample = prepare_sample_inputs(
         model=model,
         processor=processor,

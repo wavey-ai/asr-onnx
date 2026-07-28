@@ -57,6 +57,39 @@ def save_runtime_tokenizer(processor: Any, output_dir: Path) -> None:
     runtime_tokenizer.save(str(output_dir / "tokenizer.json"))
 
 
+def normalize_preprocessor_config(output_dir: Path) -> None:
+    config_path = output_dir / "preprocessor_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    filterbank = config.get("_fb_config", {})
+    fields = {
+        "dither": "dither",
+        "feature_size": "nfilt",
+        "n_fft": "n_fft",
+        "n_window_size": "n_window_size",
+        "n_window_stride": "n_window_stride",
+        "normalize": "normalize",
+        "padding_value": "pad_value",
+        "sampling_rate": "sample_rate",
+        "window": "window",
+    }
+    missing = []
+    for output_name, filterbank_name in fields.items():
+        value = config.get(output_name, filterbank.get(filterbank_name))
+        if value is None:
+            missing.append(output_name)
+        else:
+            config[output_name] = value
+    if missing:
+        raise ValueError(
+            "preprocessor export is missing runtime fields: "
+            + ", ".join(sorted(missing))
+        )
+    config_path.write_text(
+        f"{json.dumps(config, indent=2, sort_keys=True)}\n",
+        encoding="utf-8",
+    )
+
+
 def _cache_layer_tensors(cache: DynamicCache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
     if hasattr(cache, "layers"):
         layer = cache.layers[layer_idx]
@@ -546,6 +579,7 @@ def main() -> int:
     processor = AutoProcessor.from_pretrained(args.source, trust_remote_code=True)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(args.source, trust_remote_code=True).to(device).eval()
     save_processor_pretrained(processor, output_dir)
+    normalize_preprocessor_config(output_dir)
     model.config.save_pretrained(output_dir)
     model.generation_config.save_pretrained(output_dir)
     save_runtime_tokenizer(processor, output_dir)

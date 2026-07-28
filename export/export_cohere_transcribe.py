@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import onnx
 import torch
 import torch.nn as nn
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
@@ -303,18 +305,36 @@ def export_onnx(
     opset: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with torch.inference_mode():
-        torch.onnx.export(
-            module,
-            inputs,
-            str(path),
-            opset_version=opset,
-            dynamo=False,
-            export_params=True,
-            external_data=True,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
+    with tempfile.TemporaryDirectory(
+        dir=path.parent,
+        prefix=f".{path.stem}-",
+    ) as temporary_directory:
+        temporary_path = Path(temporary_directory) / path.name
+        with torch.inference_mode():
+            torch.onnx.export(
+                module,
+                inputs,
+                str(temporary_path),
+                opset_version=opset,
+                dynamo=False,
+                export_params=True,
+                external_data=True,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+            )
+
+        exported_model = onnx.load_model(temporary_path, load_external_data=True)
+        data_path = path.with_name(f"{path.name}.data")
+        path.unlink(missing_ok=True)
+        data_path.unlink(missing_ok=True)
+        onnx.save_model(
+            exported_model,
+            path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_path.name,
+            size_threshold=0,
         )
 
 
@@ -394,8 +414,6 @@ def export_decoder_prefill_onnx(
         dynamic_axes[f"self_value_{layer_idx}"] = {0: "batch", 2: "self_steps"}
         dynamic_axes[f"cross_key_{layer_idx}"] = {0: "batch", 2: "encoded_frames"}
         dynamic_axes[f"cross_value_{layer_idx}"] = {0: "batch", 2: "encoded_frames"}
-        dynamic_axes[f"self_key_out_{layer_idx}"] = {0: "batch", 2: "self_steps"}
-        dynamic_axes[f"self_value_out_{layer_idx}"] = {0: "batch", 2: "self_steps"}
 
     export_onnx(
         CohereDecoderPrefillWrapper(model).eval(),
@@ -435,6 +453,8 @@ def export_decoder_cached_step_onnx(
         dynamic_axes[f"self_value_{layer_idx}"] = {0: "batch", 2: "self_steps"}
         dynamic_axes[f"cross_key_{layer_idx}"] = {0: "batch", 2: "encoded_frames"}
         dynamic_axes[f"cross_value_{layer_idx}"] = {0: "batch", 2: "encoded_frames"}
+        dynamic_axes[f"self_key_out_{layer_idx}"] = {0: "batch", 2: "self_steps_out"}
+        dynamic_axes[f"self_value_out_{layer_idx}"] = {0: "batch", 2: "self_steps_out"}
 
     flat_inputs: list[torch.Tensor] = [encoded_length, decoder_input_ids]
     for layer_idx in range(num_layers):
